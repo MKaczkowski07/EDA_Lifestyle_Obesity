@@ -1,0 +1,741 @@
+---
+title: "Raport Analityczny: Determinanty Otyłości i Zdrowia Publicznego w USA (2011-2024)"
+author: "Mateusz Kaczkowski"
+date: "2026-01-22"
+output: 
+  html_document:
+    theme: lumen
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup_and_data, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(mice)
+library(ggplot2)
+library(corrplot)
+library(stringr)
+
+dane <- read_excel("Nutrition.xlsx", sheet = "Work_place")
+```
+
+## Wprowadzenie
+
+Celem niniejszej analizy eksploracyjnej (EDA) jest identyfikacja i zrozumienie głównych czynników demograficznych oraz ekonomicznych wpływających na wskaźniki zdrowotne społeczeństwa. Analiza opiera się na danych dotyczących nawyków żywieniowych, poziomu aktywności fizycznej oraz wskaźników otyłości.
+
+Poprzez agregację danych z podziałem na kategorie takie jak status materialny, wiek czy wykształcenie, raport weryfikuje w jakim stopniu czynniki zewnętrzne modelują dbałość o zdrowie i predyspozycje do chorób cywilizacyjnych.
+
+
+## Słownik zmiennych
+
+Poniższa tabela przedstawia strukturę analizowanego zbioru danych:
+
+```{r}
+opisy <- tribble(
+  ~Zmienna, ~Opis, ~Przyklad,
+  "State", "Nazwa stanu badanej populacji", "Alabama, Texas",
+  "Class", "Główna kategoria tematyczna wskaźnika", "Obesity, Nutrition, Physical Activity",
+  "Question", "Treść konkretnego pytania zadanego w badaniu", "Percent of adults who...",
+  "Data_Value", "Oszacowany odsetek odpowiedzi pozytywnych", "32.5 (%)",
+  "Low/High_Confidence_Limit", "Dolna i górna granica przedziału ufności dla wyniku", "30.1 - 34.9",
+  "Sample_Size", "Rozmiar badanej próbki dla danego przekroju", "3450",
+  "Strat_Category", "Główna kategoria demograficzna/społeczna", "Income, Education, Race/Ethnicity",
+  "Strat_Group", "Konkretna podgrupa w ramach wybranej kategorii", "18-24, Male, $15,000 - $24,999"
+)
+
+opisy %>%
+  kable(
+    col.names = c("Zmienna", "Opis", "Przykład"),
+    align = "l"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(3, italic = TRUE)
+```
+
+
+## Przegląd i czyszczenie danych
+
+Podczas wstępnej weryfikacji zbioru danych zidentyfikowano kilka problemów strukturalnych wymagających korekty przed przystąpieniem do właściwej analizy:
+
+1. **Niewłaściwe typy danych:** Kolumny przechowujące oszacowane odsetki oraz przedziały ufności zostały wczytane jako ciągi znaków. Wymagały one konwersji do formatu numerycznego.
+2. **Obserwacje zagregowane:** W kolumnie określającej stan (State) zidentyfikowano wartość "National", stanowiącą zbiorczą estymację dla całego kraju. Pozostawienie jej w głównym zbiorze zniekształciłoby analizy na poziomie stanowym. Obserwacje te zostały wyizolowane do osobnej ramki danych.
+3. **Terytoria zamorskie:** Zbiór zawierał dane dla terytoriów zależnych (Guam, Puerto Rico, Virgin Islands). Z uwagi na brak możliwości przypisania ich do standardowych, czterech głównych regionów geograficznych USA (wg. klasyfikacji Census Bureau), zostały one wykluczone. 
+
+Skrypt przygotowuje dane do dalszej analizy: ujednolica nazewnictwo, konwertuje typy zmiennych (m.in. na factor, żeby ograniczyć zużycie pamięci) i łączy każdy stan oraz Dystrykt Kolumbii z odpowiadającym mu makroregionem na podstawie tabeli przypisań.
+
+```{r data_cleaning}
+dane <- dane %>% 
+  rename(
+    Year = YearStart, 
+    State = LocationDesc,
+    Strat_Category = StratificationCategory1,
+    Strat_Group = Stratification1
+  ) %>%
+  mutate(
+    Data_Value = as.numeric(Data_Value),
+    Low_Confidence_Limit = as.numeric(Low_Confidence_Limit),
+    High_Confidence_Limit = as.numeric(High_Confidence_Limit)
+  )
+
+dane_national <- dane %>% filter(State == "National")
+dane <- dane %>% filter(State != "National")
+
+
+state_map <- data.frame(
+  State = state.name,
+  Region = state.region
+) %>%
+  add_row(State = "District of Columbia", Region = "South")
+
+dane_state <- dane %>% 
+  filter(!(State %in% c("Guam", "Puerto Rico", "Virgin Islands"))) %>%
+  left_join(state_map, by = "State")
+
+
+dane_state <- dane_state %>%
+  mutate(across(c(State, Region, Class, Strat_Category, Strat_Group), as.factor))
+```
+
+
+### Analiza braków danych (Missing Values)
+
+Weryfikacja kompletności zbioru wykazała występowanie braków w `r sum(is.na(dane_state))` komórkach na łączną liczbę `r nrow(dane_state)` obserwacji. W celu identyfikacji wzorców występowania braków, zastosowano analizę wizualną przy użyciu pakietu `mice`.
+
+```{r missing_values_pattern, fig.width=20, fig.height=9, out.width="100%"}
+md.pattern(dane_state, rotate.names = TRUE)
+```
+
+Wykres ujawnia pełną współzależność strukturalną – luki w wartościach estymowanych (Data_Value) systematycznie pociągają za sobą braki w powiązanych przedziałach ufności oraz zmiennych stratyfikacyjnych (LCL, HCL, SC, SG).
+
+W celu ustalenia przyczyny, zbadano rozkład braków względem poszczególnych kategorii demograficznych.
+
+```{r}
+braki_kategorie <- dane_state %>% 
+  filter(is.na(Data_Value)) %>% 
+  count(Strat_Category, sort = TRUE)
+
+knitr::kable(braki_kategorie, caption = "Braki danych w poszczególnych kategoriach stratyfikacji")
+```
+
+Największa liczba braków danych dotyczy kategorii Race/Ethnicity (Rasa/Pochodzenie). Zjawisko to wynika z metodologii badawczej – w wielu stanach (np. mniejsze demograficznie stany w regionach Midwest czy South) liczebność konkretnych mniejszości etnicznych jest zbyt niska, aby uzyskać statystycznie istotną i reprezentatywną próbę. W takich przypadkach dane są często celowo pomijane w celu uniknięcia wyciągania wniosków na podstawie zbyt małej grupy badawczej. Z tego powodu rekordy te nie zostaną usunięte ze zbioru, jednak kategoria Race/Ethnicity zostanie wykluczona z dalszych porównań, aby uniknąć wnioskowania obarczonego wysokim błędem.
+
+
+
+Zbadano również strukturę zbierania danych z podziałem na poszczególne lata i grupy:
+
+```{r}
+knitr::kable(
+  table(dane_state$Strat_Group), 
+  col.names = c("Grupa", "Liczebność"), 
+  caption = "Równomierność rozkładu obserwacji wg grup stratyfikacyjnych"
+)
+```
+
+Dane są bardzo dobrze zebrane – każda grupa stratyfikacji występuje w danych dokładnie tyle samo razy (3672 obserwacje na grupę). Potwierdza to stały schemat raportowania w poszczególnych stanach.    
+
+
+### Dostępność danych w wymiarze czasowym
+
+Zmienna liczba obserwacji w poszczególnych latach badania nie wynika z błędów w danych, lecz z metodologii ankietowania. Nie w każdym roku zadawano uczestnikom pełną pulę pytań.
+
+Aby zwizualizować, które wskaźniki były monitorowane w poszczególnych latach, każdemu pytaniu przypisano unikalny identyfikator (ID), a następnie wygenerowano macierz dostępności.
+
+```{r questions_availability, message=FALSE, warning=FALSE}
+legenda_pytan <- dane_state %>%
+  distinct(Question) %>%
+  mutate(ID = paste0("P", row_number()))
+
+mapa_danych <- dane_state %>%
+  distinct(Year, Question) %>%
+  left_join(legenda_pytan, by = "Question")
+
+
+ggplot(mapa_danych, aes(x = as.factor(Year), y = ID)) +
+  geom_tile(fill = "steelblue3", color = "white", linewidth = 0.8) + 
+  labs(
+    title = "Dostępność wskaźników w badaniach przekrojowych",
+    x = "Rok badawczy",
+    y = "Identyfikator pytania"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+```
+
+Wykres wskazuje, że jedynie kilka pytań było uwzględnianych w każdej edycji badania. Z tego powodu ewentualne luki informacyjne w trendach wieloletnich są naturalną cechą tego zbioru i będą musiały zostać uwzględnione przy budowaniu wniosków.
+
+```{r question_legend}
+knitr::kable(legenda_pytan, caption = "Słownik identyfikatorów pytań (ID)")
+
+```
+
+### Weryfikacja precyzji estymatów (Confidence Intervals)
+
+Kolejnym etapem kontroli jakości danych była analiza spójności przedziałów ufności. Weryfikacja wykazała, że 100% wartości punktowych (`Data_Value`) mieści się w wyznaczonych dla nich granicach ufności (LCL, HCL).
+
+Przeanalizowano również rozstęp przedziałów ufności. Skrajnie szeroki przedział (przyjęto próg powyżej 20 punktów procentowych) oznacza wysoką niepewność oszacowania i potencjalnie małą reprezentatywność próby. Zbadano, w których kategoriach problem ten występuje najczęściej.
+
+```{r ci_width_analysis, message=FALSE}
+dane_state <- dane_state %>% 
+  mutate(CI_Width = High_Confidence_Limit - Low_Confidence_Limit)
+
+zestawienie <- dane_state %>%
+  filter(CI_Width > 20) %>%
+  count(Question, Strat_Category) %>% 
+  left_join(legenda_pytan, by = "Question") %>% 
+  complete(ID, Strat_Category, fill = list(n = 0)) 
+
+zestawienie %>%
+  group_by(Strat_Category) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  ggplot(aes(x = reorder(Strat_Category, -n), y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Koncentracja obserwacji o niskiej precyzji (CI > 20)",
+    x = "Kategoria stratyfikacji",
+    y = "Liczba nieprecyzyjnych rekordów"
+  ) +
+  theme_minimal() +
+  coord_flip()
+
+```
+
+Największym odchyleniem i najmniejszą precyzją bezwzględnie charakteryzują się statystyki dla kategorii `Race/Ethnicity` (ponad 7000 przypadków). Wynik ten w pełni koreluje z wcześniejszą analizą braków danych. Ostatecznie potwierdza to słuszność decyzji o wykluczeniu tej zmiennej demograficznej z kluczowych wnioskowań.
+
+### Zmienność wyników estymowanych (Data_Value)
+
+Analiza głównej zmiennej numerycznej `Data_Value` (stanowiącej odsetek odpowiedzi w danej grupie) w ujęciu zagregowanym dla całego zbioru posiada ograniczone zastosowanie. Ze względu na fakt, że kolumna ta agreguje wyniki dla różnych pytań badawczych (np. poziom otyłości vs. spożycie owoców), globalna analiza rozkładu tej zmiennej nie ma uzasadnienia statystycznego.
+
+Niemniej jednak, weryfikacja wartości maksymalnych (obserwacje, gdzie odsetek przekracza 70%) pozwala zidentyfikować zjawiska o najwyższym poziomie deklaracji w amerykańskim społeczeństwie:
+
+```{r extreme_values_data}
+dane_state %>%
+  filter(Data_Value > 70) %>%
+  select(Question, State, Strat_Group, Data_Value) %>%
+  arrange(desc(Data_Value)) %>%
+  head(5) %>%
+  knitr::kable(caption = "Wskaźniki o najwyższym odsetku w badaniu")
+```
+
+Najwyższe estymaty (sięgające ponad 80%) dotyczą pytania o spełnianie minimalnych rekomendacji WHO w zakresie aktywności fizycznej (min. 150 minut umiarkowanej aktywności tygodniowo). Wysoki odsetek w tej kategorii wynika w dużej mierze z szerokiej definicji ruchu, do którego wliczają się również standardowe, codzienne czynności, jak np. spacery.
+
+
+Z uwagi na opisaną strukturę zbioru, dalsza, właściwa eksploracja zmiennej Data_Value będzie prowadzona wyłącznie w izolacji dla konkretnych pytań badawczych.
+
+
+---
+
+## Wyniki analizy eksploracyjnej
+
+### 1. Rozkład otyłości w ujęciu regionalnym
+
+Pierwszym etapem analizy jest sprawdzenie, czy poziom otyłości różni się między poszczególnymi makroregionami Stanów Zjednoczonych. Pozwoli to zidentyfikować ewentualne wzorce geograficzne.
+
+```{r obesity_by_region, message=FALSE}
+
+dane_region <- dane_state %>%
+  filter(Question == "Percent of adults aged 18 years and older who have obesity",
+         Strat_Category == "Total") %>%
+  group_by(Region) %>%
+  summarise(
+    srednia_otylosc = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+ggplot(dane_region, aes(x = reorder(Region, -srednia_otylosc), y = srednia_otylosc)) +
+  geom_col(fill = "steelblue", alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f%%", srednia_otylosc)), vjust = -0.5, fontface = "bold") +
+  scale_y_continuous(limits = c(0, max(dane_region$srednia_otylosc) * 1.15)) +
+  labs(
+    title = "Średni odsetek otyłości dorosłych wg makroregionów USA",
+    x = "Makroregion",
+    y = "Średni odsetek (%)"
+  ) +
+  theme_minimal()
+```
+
+Różnice pomiędzy makroregionami wydają się na pierwszy rzut oka relatywnie niewielkie, jednak ukrywają istotny podział. Najlepszym wskaźnikiem charakteryzuje się region Northeast (ok. 27.9%), podczas gdy region South notuje najwyższy odsetek (33.3%).
+
+Aby sprawdzić, czy obserwowane różnice między regionami są istotne statystycznie (a nie wynikają z przypadku), przeprowadzono nieparametryczny test Kruskala-Wallisa dla średnich stanowych:
+
+```{r}
+kw_data <- dane_state %>%
+  filter(Question == "Percent of adults aged 18 years and older who have obesity",
+         Strat_Category == "Total") %>% 
+  group_by(State, Region) %>%
+  summarise(obesity = mean(Data_Value, na.rm = TRUE), .groups = "drop")
+
+wynik_kw <- kruskal.test(obesity ~ Region, data = kw_data)
+wynik_kw
+```
+
+Ponieważ wartość p-value (`r format.pval(wynik_kw$p.value, digits = 3)`) jest znacznie poniżej standardowego progu istotności (0.05), odrzucamy hipotezę o równości rozkładów. Różnice w poziomie otyłości pomiędzy regionami są istotne statystycznie.
+
+Na zaobserwowane różnice geograficzne mogą wpływać również czynniki makroekonomiczne. Historycznie region South charakteryzuje się wyższym poziomem ubóstwa, natomiast Northeast osiąga lepsze wyniki pod względem dochodów i poziomu wykształcenia. Wskazuje to na potrzebę dalszej analizy czynników społeczno-ekonomicznych, które mogą mieć związek z poziomem otyłości.
+
+
+### 2. Wpływ statusu materialnego na wskaźniki otyłości
+
+Zależność między dochodem a dbałością o wagę nie jest zjawiskiem jednoznacznym. Z jednej strony, wyższe zarobki ułatwiają dostęp do wysokiej jakości żywności oraz profesjonalnej opieki prozdrowotnej. Z drugiej strony, rozwój kariery korporacyjnej często wiąże się z wysoką ekspozycją na stres oraz siedzącym trybem życia, co teoretycznie mogłoby prowadzić do trudności z utrzymaniem prawidłowej wagi. 
+
+W celu weryfikacji tych założeń, zestawiono średni odsetek otyłości z poszczególnymi przedziałami dochodowymi dla każdego z makroregionów.
+
+```{r obesity_by_income, fig.width=10, fig.height=6, warning=FALSE}
+
+poziomy_dochodu <- c(
+  "Data not reported",
+  "Less than $15,000",
+  "$15,000 - $24,999",
+  "$25,000 - $34,999",
+  "$35,000 - $49,999",
+  "$50,000 - $74,999",
+  "$75,000 or greater"
+)
+
+dane_dochod <- dane_state %>%
+  filter(
+    Strat_Category == "Income",
+    Question == "Percent of adults aged 18 years and older who have obesity"
+  ) %>%
+  mutate(Strat_Group = factor(Strat_Group, levels = poziomy_dochodu)) %>% 
+  group_by(Region, Strat_Group) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+ggplot(dane_dochod, aes(x = srednia, y = Strat_Group)) +
+  geom_segment(aes(x = 0, xend = srednia, yend = Strat_Group),
+               linewidth = 0.6, alpha = 0.5, color = "gray50") +
+  geom_point(size = 3.5, color = "steelblue") +
+  facet_wrap(~Region) +
+  labs(
+    title = "Poziom otyłości a przedział dochodowy",
+    subtitle = "Zestawienie z podziałem na makroregiony USA",
+    x = "Średni odsetek otyłości (%)",
+    y = "Roczny przedział dochodowy"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank() 
+  )
+```
+
+Wizualizacja ujawnia wyraźny, ujemnie skorelowany trend we wszystkich analizowanych makroregionach: wraz ze wzrostem dochodów, odsetek osób z otyłością konsekwentnie maleje. Największe skupisko problemu obserwuje się w grupach o najniższych dochodach (poniżej 25 000 USD).
+
+Wyniki te potwierdzają hipotezę o wpływie zasobów finansowych na styl życia. Wyższa cena świeżych, nieprzetworzonych produktów, a także koszty związane z aktywnością fizyczną (karnety, sprzęt treningowy) sprawiają, że profilaktyka zdrowotna w USA jest silnie uzależniona od statusu materialnego. Warto również zauważyć, że kategoria braku danych o dochodzie ("Data not reported") pozycjonuje się pośrodku skali.
+
+
+### 3. Edukacja a predyspozycje do otyłości
+
+Podobnie jak w przypadku dochodu, wpływ wykształcenia na zdrowie można rozpatrywać dwutorowo. Dłuższy proces edukacji i praca umysłowa często wiążą się z siedzącym trybem życia, co stanowi czynnik ryzyka. Z drugiej strony, wykształcenie silnie koreluje ze świadomością zdrowotną (tzw. *health literacy*), czyli umiejętnością selekcjonowania informacji o odżywianiu oraz świadomym dbaniem o profilaktykę.
+
+Aby zbadać ten efekt, przeanalizowano wskaźniki otyłości dla czterech poziomów wykształcenia:
+
+```{r obesity_by_education, fig.width=10, fig.height=6}
+poziomy_wyksztalcenia <- c(
+  "Less than high school",
+  "High school graduate",
+  "Some college or technical school",
+  "College graduate"
+)
+
+
+dane_edukacja <- dane_state %>%
+  filter(
+    Strat_Category == "Education",
+    Question == "Percent of adults aged 18 years and older who have obesity"
+  ) %>%
+  mutate(Strat_Group = factor(Strat_Group, levels = poziomy_wyksztalcenia)) %>%
+  group_by(Region, Strat_Group) %>%
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+ggplot(dane_edukacja, aes(x = srednia, y = Strat_Group)) + 
+  geom_segment(aes(x = 0, xend = srednia, yend = Strat_Group),
+               linewidth = 0.6, alpha = 0.5, color = "gray50") +
+  geom_point(size = 3.5, color = "steelblue") +
+  facet_wrap(~Region) +
+  labs(
+    title = "Poziom otyłości a wykształcenie",
+    subtitle = "Zestawienie z podziałem na makroregiony USA",
+    x = "Średni odsetek otyłości (%)",
+    y = "Najwyższy ukończony stopień edukacji"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+Dane wskazują na wyraźny trend spadkowy: im wyższy poziom ukończonej edukacji, tym mniejszy odsetek osób zmagających się z otyłością. Widać również zauważalną różnicę ("uskok") pomiędzy osobami posiadającymi pełne wyższe wykształcenie (College graduate) a pozostałymi grupami.
+
+Zjawisko to jest ściśle powiązane z wnioskami z poprzedniej sekcji. W amerykańskim systemie gospodarczym wyższe wykształcenie jest jednym z głównych determinantów wyższych zarobków. Mamy tu więc do czynienia ze zjawiskiem wielowymiarowym, gdzie kapitał intelektualny przekłada się zarówno na większą świadomość prozdrowotną, jak i na wyższe zasoby finansowe umożliwiające jej realizację.
+
+
+### 4. Aktywność fizyczna a zalecenia WHO
+
+Kolejnym kluczowym czynnikiem kształtującym wskaźniki zdrowotne jest poziom aktywności fizycznej. W tej sekcji poddano analizie stopień realizacji rekomendacji Światowej Organizacji Zdrowia (WHO) przez amerykańskie społeczeństwo. 
+
+W zbiorze danych zidentyfikowano pięć kategorii pytań (wskaźników) definiujących stopień intensywności wysiłku fizycznego – od jego całkowitego braku, aż po wysoce intensywne połączenie ćwiczeń aerobowych i siłowych. Z uwagi na wykazaną wcześniej dostępność wskaźników w czasie, do analizy wyselekcjonowano lata z pełnym pokryciem danych (2011, 2013, 2015, 2017, 2019, 2023).
+
+```{r physical_activity_levels, fig.width=11, fig.height=7, message=FALSE, warning=FALSE}
+
+poziomy_aktywnosci <- c(
+  "Percent of adults who engage in no leisure-time physical activity" = "Poziom 1: Brak aktywności w czasie wolnym",
+  "Percent of adults who engage in muscle-strengthening activities on 2 or more days a week" = "Poziom 2: Tylko ćwiczenia siłowe",
+  "Percent of adults who achieve at least 150 minutes a week of moderate-intensity aerobic physical activity or 75 minutes a week of vigorous-intensity aerobic activity (or an equivalent combination)" = "Poziom 3: Minimum cardio (Standard WHO)",
+  "Percent of adults who achieve at least 150 minutes a week of moderate-intensity aerobic physical activity or 75 minutes a week of vigorous-intensity aerobic physical activity (or an equivalent combination) and engage in muscle-strengthening activities on 2 or more days a week" = "Poziom 4: Kompletne (Cardio + Siłowe)",
+  "Percent of adults who achieve more than 300 minutes a week of moderate-intensity aerobic physical activity or 150 minutes a week of vigorous-intensity aerobic activity (or an equivalent combination)" = "Poziom 5: Wysoka aktywność (>300 min/tydz.)"
+)
+
+# Agregacja danych z przypisaniem nowych poziomów
+dane_aktywnosc <- dane_state %>%
+  filter(
+    Class == "Physical Activity",
+    Strat_Category == "Total",
+    Year %in% c(2011, 2013, 2015, 2017, 2019, 2023)
+  ) %>%
+  mutate(Poziom = factor(poziomy_aktywnosci[Question], levels = poziomy_aktywnosci)) %>%
+  group_by(Region, Poziom) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Wizualizacja
+ggplot(dane_aktywnosc, aes(x = Region, y = srednia, fill = Poziom)) +
+  geom_col(color = "white", position = position_dodge(width = 0.85)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Struktura aktywności fizycznej dorosłych",
+    subtitle = "Średni odsetek populacji w latach 2011-2023",
+    x = "Makroregion",
+    y = "Średni odsetek (%)",
+    fill = "Rodzaj aktywności:"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(face = "bold")
+  )
+```
+
+Na podstawie powyższego zestawienia można wyciągnąć następujące wnioski dotyczące zachowań społecznych:
+
+1. **Podobieństwo między regionami:** Poziom aktywności fizycznej jest bardzo zbliżony we wszystkich makroregionach, co może sugerować, że nawyki związane z aktywnością są kształtowane bardziej przez ogólne wzorce społeczne niż przez specyfikę poszczególnych regionów.
+
+2. **Dominacja podstawowego poziomu aktywności:** We wszystkich regionach największy odsetek populacji deklaruje spełnianie podstawowych zaleceń dotyczących aktywności fizycznej (Poziom 3)
+
+3. **Problem braku aktywności:** W każdym regionie ponad 20% populacji deklaruje brak aktywności fizycznej w czasie wolnym (Poziom 1), co wskazuje, że znaczna część społeczeństwa prowadzi mało aktywny tryb życia.
+
+4. **Najmniejsza popularność kompleksowego treningu:** Najmniejszy odsetek populacji realizuje najbardziej kompleksowy model aktywności, łączący ćwiczenia aerobowe z treningiem wzmacniającym (Poziom 4). Wyjątkiem jest region West, gdzie udział osób należących do tej grupy jest nieznacznie wyższy.
+
+
+### 5. Wpływ intensywności aktywności fizycznej na otyłość
+
+Kolejnym etapem jest weryfikacja statystycznej siły związku pomiędzy określonymi poziomami aktywności fizycznej a wskaźnikami otyłości w poszczególnych stanach. Ze względu na charakter danych zrezygnowano z parametrycznego testu Pearsona na rzecz korelacji rang Spearmana.
+
+W celu obliczenia współczynników korelacji, przekształcono zbiór z formatu długiego (long) na szeroki (wide), grupując wyniki według poszczególnych lat i stanów.
+
+```{r obesity_activity_correlation, message=FALSE, warning=FALSE}
+dane_otylosc_korelacja <- dane_state %>%
+  filter(
+    Question == "Percent of adults aged 18 years and older who have obesity",
+    Strat_Category == "Total",
+    Year %in% c(2011, 2013, 2015, 2017, 2019, 2023)
+  ) %>%
+  select(Year, State, Otylosc_Proc = Data_Value)
+
+
+dane_korelacja <- dane_state %>%
+  filter(
+    Class == "Physical Activity",
+    Strat_Category == "Total",
+    Year %in% c(2011, 2013, 2015, 2017, 2019, 2023)
+  ) %>%
+  mutate(Poziom = factor(poziomy_aktywnosci[Question], levels = poziomy_aktywnosci)) %>%
+  select(Year, State, Poziom, Aktywnosc_Proc = Data_Value) %>%
+  pivot_wider(names_from = Poziom, values_from = Aktywnosc_Proc) %>%
+  left_join(dane_otylosc_korelacja, by = c("Year", "State"))
+
+
+korelacje <- sapply(
+  dane_korelacja %>% select(starts_with("Poziom")), 
+  function(x) cor(x, dane_korelacja$Otylosc_Proc, method = "spearman", use = "complete.obs")
+)
+
+
+tabela_korelacji <- data.frame(
+  Rodzaj_Aktywnosci = names(korelacje),
+  Korelacja_Spearmana = round(korelacje, 3)
+) %>% arrange(Korelacja_Spearmana) 
+
+knitr::kable(tabela_korelacji, caption = "Współczynnik korelacji Spearmana: Aktywność vs Otyłość", row.names = FALSE)
+```
+
+Jak pokazują wyliczone współczynniki, poszczególne poziomy aktywności fizycznej w różnym stopniu współwystępują ze wskaźnikami otyłości na poziomie stanowym. 
+
+* Zdecydowanie najsilniejszy, dodatni związek obserwujemy w przypadku całkowitego braku aktywności w czasie wolnym (Poziom 1). Korelacja na poziomie blisko 0.56 wskazuje, że w stanach z większym odsetkiem osób nieaktywnych notuje się wyższy odsetek osób zmagających się z otyłością. 
+
+* Co jednak najciekawsze z analitycznego punktu widzenia, patrząc na ujemne współczynniki, najsilniejszy związek z niższą otyłością (-0.34) wykazuje samo spełnianie podstawowego minimum rekomendowanego przez WHO (Poziom 3). Korelacja ta jest wyraźniejsza niż w przypadku treningów najbardziej obciążających czy łączących cardio z siłownią (Poziomy 4 i 5, gdzie współczynniki spadają do poziomu ok. -0.23). Wykonywanie wyłącznie ćwiczeń siłowych (Poziom 2) wykazuje z kolei minimalny związek z poziomem otyłości (-0.09).
+
+Powyższe wyniki pozwalają postawić tezę, że z perspektywy zdrowia całej populacji największe znaczenie ma wyrabianie absolutnie podstawowych nawyków ruchowych (takich jak regularne spacery czy jazda na rowerze), a niekoniecznie promowanie wysoce intensywnych treningowów.
+
+### 6. Wpływ edukacji na nawyki ruchowe
+
+Wcześniejsze etapy analizy wykazały, że wyższe wykształcenie silnie wiąże się z niższym odsetkiem otyłości. Skoro dowiedziono już, że aktywność fizyczna stanowi kluczowy mechanizm zapobiegania otyłości, logicznym następstwem jest weryfikacja, czy wykształcenie jest w istocie czynnikiem stymulującym uprawianie sportu.
+
+```{r education_vs_activity, fig.width=12, fig.height=7, message=FALSE, warning=FALSE}
+poziomy_wyksztalcenia_malejaco <- c(
+  "College graduate",
+  "Some college or technical school",
+  "High school graduate",
+  "Less than high school"
+)
+
+dane_edukacja_aktywnosc <- dane_state %>% 
+  filter(
+    Class == "Physical Activity",
+    Strat_Category == "Education",
+    Year %in% c(2011, 2013, 2015, 2017, 2019, 2023)
+  ) %>% 
+  mutate(
+    Poziom = factor(poziomy_aktywnosci[Question], levels = poziomy_aktywnosci),
+    Strat_Group = factor(Strat_Group, levels = poziomy_wyksztalcenia_malejaco)
+  ) %>%
+  group_by(Strat_Group, Poziom) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(dane_edukacja_aktywnosc, aes(x = Strat_Group, y = srednia, fill = Poziom)) +
+  geom_col(color = "white", position = position_dodge(width = 0.85)) +
+  scale_fill_brewer(palette = "Blues") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    title = "Poziom wykształcenia a zaangażowanie w aktywność fizyczną",
+    x = "Najwyższy ukończony stopień edukacji",
+    y = "Średni odsetek badanych (%)",
+    fill = "Rodzaj aktywności:"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.title = element_text(face = "bold"),
+    axis.text.x = element_text(vjust = 1)
+  )
+```
+
+Wizualizacja ukazuje wyraźne różnice w deklarowanych nawykach ruchowych w zależności od poziomu edukacji. Najbardziej zauważalnym zjawiskiem jest spadek odsetka osób całkowicie unikających sportu (Poziom 1) – w grupie bez dyplomu szkoły średniej (Less than high school) brak aktywności jest powszechny, natomiast u absolwentów uczelni wyższych zjawisko to występuje niemal trzykrotnie rzadziej.
+
+We wszystkich analizowanych grupach najczęściej raportowanym zachowaniem jest realizacja podstawowego minimum cardio (Poziom 3). Zgodnie z widocznym na wykresie trendem, najwyższy odsetek w tej kategorii przypada na osoby z pełnym wykształceniem wyższym, a drugą najwyższą wartość notuje się w grupie z wykształceniem niepełnym wyższym lub technicznym (Some college or technical school). Jednocześnie wyższy poziom edukacji wyraźnie sprzyja podejmowaniu najbardziej wymagających form treningu (Poziomy 4 i 5).
+
+
+Powyższy obraz, choć z punktu widzenia statystyki ukazuje jedynie współwystępowanie zjawisk, bardzo dobrze wpisuje się w koncepcję tzw. "health literacy". Sugeruje ona, że dłuższy proces edukacji często idzie w parze z wyższą świadomością prozdrowotną, co z kolei może przekładać się na częstsze podejmowanie aktywności fizycznej.
+
+ 
+### 7. Nawyki żywieniowe: spożycie owoców i warzyw
+
+Oprócz aktywności fizycznej, kluczowym filarem profilaktyki zdrowotnej jest dieta. W badanym zbiorze wyodrębniono dwa wskaźniki określające dietetyczne niedobory: odsetek dorosłych spożywających owoce rzadziej niż raz dziennie oraz analogiczny wskaźnik dla warzyw. 
+
+W celu porównania skali obu zjawisk na poziomie ogólnokrajowym, zestawiono ich rozkłady za pomocą wykresu boxplot.
+
+```{r diet_boxplots, fig.width=8, fig.height=5, message=FALSE, warning=FALSE}
+dane_dieta <- dane_state %>%
+  filter(
+    Class == "Fruits and Vegetables",
+    Strat_Category == "Total",
+    Question %in% c(
+      "Percent of adults who report consuming fruit less than one time daily",
+      "Percent of adults who report consuming vegetables less than one time daily"
+    )
+  ) %>%
+  mutate(Kategoria = ifelse(grepl("fruit", Question), "Owoce", "Warzywa"))
+
+
+ggplot(dane_dieta, aes(x = Kategoria, y = Data_Value, fill = Kategoria)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.shape = 1) +
+  scale_fill_manual(values = c("Owoce" = "steelblue", "Warzywa" = "steelblue")) +
+  labs(
+    title = "Skala niedoborów w diecie (spożycie < 1 raz dziennie)",
+    subtitle = "Porównanie rozkładu oszacowań dla owoców i warzyw",
+    x = "",
+    y = "Odsetek badanych (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+```
+
+Odsetek osób ze skrajnie niskim spożyciem owoców (mediana ok. 39%) jest dwukrotnie wyższy niż w przypadku warzyw (mediana ok. 19%). Różnica ta może częściowo wynikać z definicji stosowanej w statystykach — do "warzyw" zalicza się często ziemniaki, w tym frytki, przez co niemal każdy fast-food czy danie główne automatycznie liczy się jako porcja warzyw. Owoce nie mają takiego "ukrytego" źródła w typowej diecie, więc ich regularne spożycie w większym stopniu zależy od świadomej decyzji.
+
+
+### 8. Siła wpływu: Dieta vs. Aktywność fizyczna
+
+Aby odpowiedzieć na pytanie, który z czynników ryzyka – niedobór owoców w diecie czy całkowity brak aktywności fizycznej – wykazuje silniejszy związek z otyłością, przeprowadzono analizę korelacyjną. Z uwagi na ograniczenia w gromadzeniu danych żywieniowych, analizę zawężono do lat wspólnych dla wszystkich trzech wskaźników (2017, 2019, 2021).
+
+```{r obesity_diet_vs_sport, fig.width=10, fig.height=5, message=FALSE, warning=FALSE}
+
+dane_porownanie <- dane_state %>%
+  filter(
+    Strat_Category == "Total",
+    Year %in% c(2017, 2019, 2021),
+    Question %in% c(
+      "Percent of adults aged 18 years and older who have obesity",
+      "Percent of adults who report consuming fruit less than one time daily",
+      "Percent of adults who engage in no leisure-time physical activity"
+    )
+  ) %>%
+  select(Year, State, Question, Data_Value) %>%
+  mutate(Question = case_when(
+    grepl("obesity", Question) ~ "Otylosc",
+    grepl("fruit", Question) ~ "Brak_Owocow",
+    grepl("no leisure-time", Question) ~ "Brak_Ruchu"
+  )) %>%
+  pivot_wider(names_from = Question, values_from = Data_Value)
+
+
+kor_owoce <- cor.test(dane_porownanie$Otylosc, dane_porownanie$Brak_Owocow, method = "spearman", use = "complete.obs")
+kor_ruch <- cor.test(dane_porownanie$Otylosc, dane_porownanie$Brak_Ruchu, method = "spearman", use = "complete.obs")
+
+
+dane_wykres <- dane_porownanie %>%
+  pivot_longer(cols = c(Brak_Owocow, Brak_Ruchu), names_to = "Czynnik", values_to = "Odsetek") %>%
+  mutate(Czynnik = ifelse(Czynnik == "Brak_Owocow", "Niedobór owoców (< 1x dziennie)", "Brak aktywności fizycznej"))
+
+
+ggplot(dane_wykres, aes(x = Odsetek, y = Otylosc, color = Czynnik)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 1) +
+  facet_wrap(~ Czynnik, scales = "free_x") +
+  scale_color_manual(values = c("Niedobór owoców (< 1x dziennie)" = "steelblue3", "Brak aktywności fizycznej" = "steelblue3")) +
+  labs(
+    title = "Czynniki ryzyka a poziom otyłości (2017, 2019, 2021)",
+    x = "Odsetek populacji z danym czynnikiem ryzyka (%)",
+    y = "Odsetek osób z otyłością (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold", size = 11))
+```
+
+Analiza statystyczna (test korelacji Spearmana) dla obu zjawisk pozwala na odrzucenie hipotezy zerowej o braku powiązań (p-value < 0.05 w obu przypadkach). Istnieje wysoce istotna statystycznie, dodatnia korelacja:
+
+* Korelacja między brakiem ruchu a otyłością wynosi: `r round(kor_ruch$estimate, 2)`
+
+* Korelacja między niedoborem owoców a otyłością wynosi: `r round(kor_owoce$estimate, 2)`
+
+Oba czynniki są stymulantami otyłości, jednak korelacja związana z ubogą dietą (rzadkim spożywaniem owoców) jest zauważalnie silniejsza niż ta wynikająca z bezruchu.
+
+Wniosek ten ma kluczowe znaczenie dla profilaktyki zdrowia publicznego. Sugeruje on, że interwencje behawioralne oparte na modyfikacji nawyków żywieniowych (zwiększenie podaży błonnika i witamin z owoców) mogą przynosić szybsze i bardziej wymierne efekty niż próby radykalnej zmiany przyzwyczajeń ruchowych, które często wymagają większego nakładu czasu i woli.
+
+### 9. Wpływ statusu materialnego na nawyki żywieniowe
+
+Biorąc pod uwagę siłę wpływu diety na otyłość, należy zbadać, czy jakość odżywiania jest determinowana przez zasoby finansowe obywateli. W amerykańskim systemie żywnościowym tzw. "pustynie żywnościowe" (food deserts) oraz wysokie ceny nieprzetworzonej żywności często stanowią barierę dla osób najuboższych.
+
+```{r income_vs_diet, fig.width=10, fig.height=6, message=FALSE, warning=FALSE}
+
+dane_dieta_dochod <- dane_state %>% 
+  filter(
+    Strat_Category == "Income",
+    Question %in% c("Percent of adults who report consuming fruit less than one time daily", 
+                    "Percent of adults who report consuming vegetables less than one time daily")
+  ) %>% 
+  mutate(
+    Kategoria = ifelse(grepl("fruit", Question), "Niedobór owoców (< 1x dziennie)", "Niedobór warzyw (< 1x dziennie)"),
+    Strat_Group = factor(Strat_Group, levels = poziomy_dochodu)
+  ) %>% 
+  group_by(Kategoria, Strat_Group) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+ggplot(dane_dieta_dochod, aes(x = Strat_Group, y = srednia, fill = Kategoria)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_wrap(~Kategoria, ncol = 1) +
+  scale_fill_manual(values = c("Niedobór owoców (< 1x dziennie)" = "steelblue", "Niedobór warzyw (< 1x dziennie)" = "steelblue")) +
+  labs(
+    title = "Poziom dochodu a braki w diecie",
+    x = "Roczny przedział dochodowy",
+    y = "Średni odsetek osób z niedoborem żywieniowym (%)"
+  ) + 
+  theme_bw() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+```
+
+Im wyższy dochód, tym rzadziej ludzie zgłaszają niedobory owoców i warzyw — zależność jest wyraźna. Ciekawsze jest jednak to, że różnica między najbiedniejszą a najbogatszą grupą jest prawie dwa razy większa dla warzyw (ok. 16.6 p.p.) niż dla owoców (ok. 8.6 p.p.). Może to wynikać z tego, że podstawowe owoce (banany, jabłka) są relatywnie tanie i dostępne niezależnie od dochodu, podczas gdy pełnowartościowa dieta warzywna wymaga większych nakładów — czy to na świeże produkty, czy na czas potrzebny do ich przygotowania. Dochód wydaje się więc silniejszą barierą dla warzyw niż dla owoców.
+
+
+### 10. Długoterminowe trendy wskaźnika otyłości (2011-2023)
+
+Na zakończenie analizy eksploracyjnej poddano weryfikacji ogólny trend otyłości w wymiarze czasowym, aby ustalić, czy zjawisko to ulega stabilizacji, czy dalszej eskalacji.
+
+```{r}
+dane_trend <- dane_state %>% 
+  filter(
+    Question == "Percent of adults aged 18 years and older who have obesity",
+    Strat_Category == "Total"
+  ) %>%
+  group_by(Year, Region) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(dane_trend, aes(x = as.factor(Year), y = srednia, color = Region, group = Region)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Dynamika wskaźników otyłości w USA w latach 2011-2023",
+    x = "Rok badawczy",
+    y = "Średni odsetek otyłości (%)",
+    color = "Makroregion"
+  ) +
+  theme_bw()
+```
+
+Dane z lat 2011–2024 wykazują wyraźny, długoterminowy trend wzrostowy odsetka dorosłych osób z otyłością we wszystkich makroregionach Stanów Zjednoczonych. Od początku analizowanej dekady najwyższe wskaźniki niezmiennie notują regiony South oraz North Central, które znacząco odstają od pozostałych części kraju. 
+
+Mimo ogólnej tendencji rosnącej, w danych można zaobserwować lokalne fluktuacje. Wartym odnotowania sygnałem jest zauważalny spadek i wypłaszczenie krzywej dla regionu South po roku 2021, co wyróżnia się na tle regionu North Central, który w tym samym czasie kontynuował trend wzrostowy. Regiony West i Northeast charakteryzują się najniższymi wskaźnikami w kraju, wykazując niemal identyczną, zbieżną dynamikę na przestrzeni całego badanego okresu.
+
+---
+
+## Podsumowanie i wnioski końcowe
+
+Z przeprowadzonej analizy wynika, że otyłość w USA to problem wieloczynnikowy, w którym nawyki behawioralne i status społeczno-ekonomiczny odgrywają porównywalną rolę.
+
+1. Bardzo wyraźny związek widać między niższym wykształceniem i niskimi dochodami a wyższym ryzykiem otyłości — prawdopodobnie dlatego, że gorsza sytuacja ekonomiczna ogranicza dostęp do zdrowej żywności i wiedzy o zdrowym stylu życia, choć samo EDA nie pozwala tego jednoznacznie potwierdzić.
+
+2. Zarówno brak aktywności fizycznej, jak i dieta uboga w owoce korelują z otyłością w populacji, przy czym w analizowanych danych to czynnik dietetyczny wykazuje silniejszą zależność niż brak ruchu.
+
+3. W badanym okresie (ostatnia dekada) otyłość wykazywała długoterminowy trend wzrostowy we wszystkich analizowanych makroregionach — co sugeruje, że to zjawisko o szerokim krajowym zasięgu, a nie lokalna anomalia.

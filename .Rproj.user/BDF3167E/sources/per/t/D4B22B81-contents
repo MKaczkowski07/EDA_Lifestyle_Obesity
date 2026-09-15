@@ -1,0 +1,20 @@
+install.packages("readxl")
+install.packages("dplyr")
+library(readxl)
+library(dplyr)
+
+dane <- read_excel("Nutrition.xlsx", sheet = "Work_place")
+View(dane)
+
+str(dane)
+summary(dane)
+
+dane <- dane %>%
+  mutate(
+    Data_Value = as.numeric(Data_Value),
+    Low_Confidence_Limit = as.numeric(Low_Confidence_Limit),
+    High_Confidence_Limit = as.numeric(High_Confidence_Limit)
+  )
+
+
+summary(dane)

@@ -1,0 +1,966 @@
+---
+title: "EDA: Badanie czynników kształtujących zdrowie"
+author: "Mateusz Kaczkowski"
+date: "2026-01-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Wprowadzenie
+
+Zdrowie to znacznie więcej niż brak chorób – stanowi fundament codziennego dobrostanu oraz poziomu energii, z jakim funkcjonujemy w społeczeństwie. Jak trafnie zauważył Denis Waitley:  
+*„Czas i zdrowie to dwa cenne skarby, których nie rozpoznajemy i nie doceniamy, dopóki się nie wyczerpią.”*   
+
+Dzięki analizie danych dotyczących diety i ruchu, podzielonych na kategorie demograficzne, sprawdzimy, w jakim stopniu czynniki zewnętrzne takie jak status materialny czy wykształcenie – modelują nasze podejście do dbałości o siebie.
+
+
+## Zmienne
+* State - nazwa stanu
+* Class - główna kategoria tematyczna wskaźnika (np. Obesity / Nutrition)
+* Question - pytanie zadane w badaniu
+* Data_Value -oszacowany odsetek (%)
+* Low_Confidence_Limit - dolna granica przedziału ufności
+* High_Confidence_Limit - górna granica przedziału ufności
+* Sample_Size - rozmiar badanej próbki
+* Strat_Category - Kategoria (np. "Income", "Education, "Race/Ethnicity")
+* Strat_Group - podgrupa w kategorii (np. "18-24", "Male", "15,000 - 24,999").
+
+## Pakiety, których będę używał
+```{r, warning = FALSE, message= FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(mice)
+library(ggplot2)
+library(corrplot)
+```
+
+## Ogląd oraz czyszczenie danych
+
+```{r}
+dane <- read_excel("Nutrition.xlsx", sheet = "Work_place")
+
+str(dane)
+summary(dane)
+```
+
+DLa czytelności zmieniam nazwy kolumn
+```{r}
+dane <- dane %>% 
+  rename(Year = YearStart, 
+         State = LocationDesc ,
+         Strat_Category = StratificationCategory1,
+         Strat_Group = Stratification1
+         )
+```
+
+Widzę, że pozycje Data_Value, Low_Confidence_Limit oraz High_Confidence_Limit nie są numeryczne.  
+Zmieniam:
+```{r}
+dane <- dane %>%
+  mutate(
+    Data_Value = as.numeric(Data_Value),
+    Low_Confidence_Limit = as.numeric(Low_Confidence_Limit),
+    High_Confidence_Limit = as.numeric(High_Confidence_Limit)
+  )
+
+str(dane)
+```
+
+
+Do dalszej analizy warto będzie przypisać stany do 4 głównych regionów USA (według klasyfikacji Census)  
+Można zobczyć jak to wygląda na mapie: [https://www2.census.gov/geo/pdfs/maps-data/maps/reference/us_regdiv.pdf]
+```{r}
+state_map <- data.frame(
+  State = state.name,
+  Region = state.region
+  )
+```
+
+Zobaczmy czy wszystko się zgrywa
+```{r}
+zgranie <- setdiff(unique(dane$State), state_map$State)
+print(zgranie)
+```
+
+Pojawiła mi się nieoczekiwana zmienna "National" (oprócz 4 terytoriów, które nie są uzawane za stany i nie znajdują się w state_map)
+```{r}
+dane %>% 
+  filter(State == "National") %>% 
+  summary()
+```
+
+Odkryliśmy tutaj przypadkiem bardzo ważną rzecz - w naszych danych istnieje wynik zbiorczy dla całych Stanów Zjednoczonych (ogólnokrajowa estymacja). Gdybym to zostawił to w analizach porównujących stany byłyby dodatkową obserwacją i zniekształcałyby statystyki stanowe. 
+Usuńmy tą pozycje z głównego zestawu (zostawimy ją w innej zmiennej by ewentualnie móc porównywać wyniki w stanach do poziomu krajowego)
+
+```{r}
+dane_national <- dane %>%
+  filter(State == "National")
+
+dane <- dane %>%
+  filter(State != "National")
+```
+
+Obszary (oprócz DC), które nie są w programie przypisane do żadnego regionu wyklucze z danych - zebrane w tych rejonach informacje mogą być niepewne. Z kolei Distinc of Columbia jako stolica administracyjna kraju i leżaca bezpośrednio w regionie South możemy dodać no naszego badanego zestawu.
+```{r}
+dane_state <- dane %>% 
+  filter(!(State %in% c("Guam", "Puerto Rico", "Virgin Islands")))
+
+state_map <- state_map %>%  
+  add_row(State = "District of Columbia", Region = "South")
+```
+
+I teraz połączmy tabelę state_map (czyli stan + region) z naszym danymi z samymi stanami
+```{r}
+dane_state <- dane_state %>%
+  left_join(state_map, by = "State")
+```
+
+
+Dla niektórych zmiennych lepiej działać na typie factor
+
+```{r}
+dane_state <- dane_state %>%
+  mutate(
+    State = factor(State),
+    Region = factor(Region),
+    Class = factor(Class),
+    Strat_Category = factor(Strat_Category),
+    Strat_Group = factor(Strat_Group)
+  )
+```
+
+Co więcej niektóre grupy powinny być uszeregowane (np dochód czy wiek). Jednak z uwagi, że kolumna Strat_Group posiada wszystkie kategorie to problematyczne byłby nadawanie poziomów dla ich wszystkich na raz. Zajmiemy się tym, gdy będzie to potrzebne w konkretnej analizie. 
+
+---
+
+#### Sprawdźmy jak wygląda sytuacja z wartościami pustymi
+
+```{r}
+sum(is.na(dane_state))
+```
+
+Występują braki w 51.130 na 102.816 to całkiem sporo. Przyjrzyjmy się temu bliżej.  
+Wykorzystam do tego pakiet mice
+
+```{r, fig.width=20, fig.height=9, out.width="100%"}
+md.pattern(dane_state, rotate.names = TRUE)
+```
+Wszystko jasne - skoro mamy braki w kolumnie data_value to również będą występować braki w kolumnach (LCL,HCL, SC, SG)   
+Zobaczmy jak to jest z kategoriami
+
+```{r}
+braki_kategorie <- dane_state %>% 
+  filter(is.na(Data_Value)) %>% 
+  count(Strat_Category, sort = TRUE)
+
+knitr::kable(braki_kategorie, caption = "Braki danych w poszczególnych kategoriach")
+```
+
+Największa liczba braków danych występuje w kategorii Race/Ethnicity. Może to wynikać z faktu, że w wielu stanach liczebność konkretnych mniejszości etnicznych (np. nielicznej ilości Azjatów miszkających w Alabamie) jest zbyt niska, aby uzyskać reprezentatywną próbę. W takich przypadkach dane są często celowo pomijane w celu uniknięcia wyciągania wniosków na podstawie zbyt małej grupy badawczej.
+Jednak na ten moment nie będę usuwał rekordów związanych z tą kategorią.
+
+
+
+Chciałbym się upewnić, czy na przestrzeni lat badacze konsekwentnie zbierali te same dane. Być może zauważono, że w niektórych stanach (jak we wspomnianej Alabamie) liczebność pewnych grup jest stale zbyt niska, co mogło wpłynąć na decyzję o zmianie sposobu raportowania w kolejnych latach i spowodować braki w danych.
+
+```{r}
+c <- table(dane_state$Strat_Group)
+knitr::kable(c, col.names = c("Grupa", "Liczebność"), caption = "Podsumowanie grup")
+```
+
+Dane są bardzo dobrze zebrane – każda grupa stratyfikacji występuje w danych dokładnie tyle samo razy (3672 obserwacje na grupę). Takie coś pokazuje, że badacze przyjęli stały schemat raportowania, w którym każdy stan dostarcza informacje o wszystkich grupach w stałych odstępach czasu.    
+
+Żeby nie było nieporozumień: ewentualne braki danych (NA), o których wspomniałem wcześniej, nie wynikają z pominięcia wierszy, lecz z braku konkretnych wartości dla już istniejących rekordów.
+
+Liczba 3672 zapewne wzieła się z prostego iloczynu: $lata * ilość stanów * ilość pytań$  
+Upewnijmy się:
+
+```{r}
+iloczyn<- length(unique(dane_state$Year)) * length(unique(dane_state$State)) * length(unique(dane_state$Question))
+print(iloczyn)
+```
+
+Iloczyn wyszedł większy niż wcześniej ukazana wartość 3672 (brakuje nam 2754). Skoro dla każdego roku mamy 50 stanów (w tym DC, wiec ogólnie 51), to być może nie zawsze zadawane było każde pytanie...
+
+Zobaczmy ile razy każde pytanie występuje w każdym roku
+```{r}
+mapa_pytan <- table(dane_state$Question, dane_state$Year)
+
+knitr::kable(mapa_pytan, caption = "Pytania zadawane na przestrzeni lat")
+```
+
+
+
+Moje wątpliwości zostały wyjaśnione. Nie w każdym roku grupa badawcza zadawała uczestnikom te same pytanie.  
+Jednocześnie liczba 1428 się zgadza: $51 stanów * 28 grup$.    
+Czyli jeżeli w danym roku zdecydowano się zadać poszczególne pytanie to zostało ono zebrane dla wszystkich 51 stanów z podziałem na nasze 28 grup.
+
+Ile dokładnie mamy braków?
+```{r}
+table(mapa_pytan)
+```
+
+I tu się rozwiązuje problem z brakującymi 2754 kombinacjami.
+
+* Faktycznie zadanych pytań przez 14 lat: $72$
+* Oraz 51 stanów daje: $51 * 72 = 3672$
+* Jak i nasze braki: $54 * 51 = 2754$
+
+Dla lepszego rozeznania zobaczmy jak to wygląda na wykresie:    
+(Z uwagi na długość pytań, które mogą wpłynąć na czytelność wykresu przypisze im konkretne ID)
+```{r}
+legenda_pytan <- dane_state %>%
+  distinct(Question) %>%
+  mutate(ID = paste0("P", row_number()))
+```
+
+```{r}
+mapa_danych <- dane_state %>%
+  distinct(Year, Question) %>%
+  left_join(legenda_pytan, by = "Question")
+
+mapa_danych %>% 
+  ggplot(aes(x = as.factor(Year), y = ID)) +
+  geom_tile(fill = "steelblue3", color = "white", linewidth = 0.8) + 
+  labs(
+    title = "Dostępność danych w czasie",
+    x = "Rok",
+    y = "Numer pytania"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+  )
+```
+```{r}
+knitr::kable(legenda_pytan, caption = "Legenda Pytań")
+```
+
+
+Teraz już widzimy, jak wygląda kwestia z pytaniami w poszczególnych latach - jedynie 3 pytania były sukcesywnie zadawane z roku na rok. Tym samym rozwiązała się kwestia braku danych. Moim zdaniem nie trzeba usuwać tych pustych miejsc - będziemy analizować zależności w różnych przedziałach czasowych.
+
+---
+
+Przejdźmy do kolejnych zmiennych - granic przedziału ufnośc.  
+Wpierw zobaczmy czy istnieje sytuacja gdzie Data_Value nie mieści się w przedziale ufności
+
+```{r}
+dane_state %>% 
+  filter(Data_Value < Low_Confidence_Limit | Data_Value > High_Confidence_Limit) %>% 
+  nrow()
+```
+Bardzo dobra informacja. We wszystkich rekordach wartość estymowana (Data_Value) mieści się w raportowanych przedziałach ufności. Gdybyśmy otrzymali wartość różną od zera to trzeba by było sprawdzić czy dany rekord nie zawiera błędu (przedział ufności jest budowany wokół wartości estymowanej)
+
+Popatrzmy na podstawowe statystyki związane z szerokością przedziału ufności:
+```{r}
+summary(dane_state$High_Confidence_Limit -dane_state$Low_Confidence_Limit )
+```
+Połowa naszych danych (czyli ponad 55 tyś) ma widełki nie szersze niż 7.5 punktu procentowego - to bardzo dobra wiadomość.  
+Uwagę od razu przykuwa wartość maksymalna 59.2 - jest to bardzo duży przedział ufności i tak naprawdę wynik tego badania może być mało precyzyjne.  Zidentyfikujmy ten rekord:
+
+```{r}
+dane_state %>% 
+  filter(High_Confidence_Limit -Low_Confidence_Limit > 59) %>% 
+  select(Year, State, Class, Strat_Category, Data_Value)
+```
+
+Dla większego spokoju zobaczmy jak sytuacja wygląda dla 10 rekordów:
+
+```{r}
+dane_state %>% 
+  mutate(CI_Width = High_Confidence_Limit -Low_Confidence_Limit) %>% 
+  select(Year, State, Class, Strat_Category, CI_Width) %>% 
+  arrange(desc(CI_Width)) %>% 
+  head(10)
+
+```
+
+Jenak więcej rekordów niż przypuszczałem może mieć dość szeroki przedział ufności. Poszerzmy pole widzenia przyjmując, że powyżej 20 pkt procentowych dane mogą być już uważane za mało wiarygodne. 
+
+```{r}
+dane_state <- dane_state %>% 
+  mutate(CI_Width = High_Confidence_Limit -Low_Confidence_Limit)
+
+dane_state %>% 
+  filter(CI_Width > 20) %>% 
+  select(Year, State, Class, Strat_Category, CI_Width) 
+```
+
+Około 7.5 tyś rekordów. Ciekawe czy ponownie wpływ na to miałby grupy stratyfikacji czy coś innego. 
+Rozbijmy to na przypadki by mieć szerszy pogląd sytuacji:
+
+* Kategoria
+```{r}
+kat_wartosc <- dane_state %>% 
+  filter(CI_Width > 20) %>% 
+  count(Strat_Category, sort = TRUE )
+
+print(kat_wartosc)
+```
+Ponad 7 tyś rekordów dotyczy pochodzenia. Pozostałe kategorie stanowią zdecydowaną mniejszość
+
+* Pytanie
+```{r}
+pyt_wartosc <- dane_state %>% 
+  filter(CI_Width > 20) %>% 
+  count(Question, sort = TRUE )
+
+print(pyt_wartosc)
+```
+Widać najbardziej problemowe pytania. Czy są one związane z kategorią?
+
+Połączmy ostatnie dwie zmienne
+```{r}
+zestawienie_kat_qest <- dane_state %>%
+  filter(CI_Width > 20) %>%
+  count(Question, Strat_Category, sort = TRUE)
+
+print(zestawienie_kat_qest)
+```
+Czyli to głównie kategoria Race/Ethnicity ma mało wiarygodne dane.  
+Szybki podgląd na wykres:
+```{r}
+zestawienie<- dane_state %>%
+  filter(CI_Width > 20) %>%
+  count(Question, Strat_Category) %>% 
+  left_join(legenda_pytan, by = "Question") %>% 
+  complete(ID, Strat_Category, fill = list(n = 0)) 
+```
+
+
+```{r}
+  zestawienie %>%
+    group_by(Strat_Category) %>%
+    summarise(
+      n = sum(n), 
+      .groups = "drop") %>%
+  
+    ggplot(aes(x = Strat_Category, y = n)) +
+    geom_col(fill = "steelblue") +
+    labs(
+      title = "Liczba przypadków z CI > 20 według kategorii",
+      x = "Kategoria stratyfikacji",
+      y = "Liczba przypadków"
+    ) +
+    theme_minimal()
+```
+
+Patrząc, na problemy związane z Race/Ethnicity myślę, że rozsądnie będzie nie analizować tej zmiennej w dalszej analizie.
+
+Jeszcze szybkie spojrzenie na rok:
+```{r}
+rok_wartosc <- dane_state %>% 
+  filter(CI_Width > 20) %>% 
+  count(Year) %>% 
+  
+  ggplot(aes(x = as.factor(Year), y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Liczba niepewnych rekordów na przestrzeni lat",
+    subtitle = "CI Width > 20",
+    x = "Rok",
+    y = "Liczba wystąpień"
+  ) +
+  theme_bw()
+
+print(rok_wartosc)
+```
+
+Różna liczba rekordów o dużym przedziale ufności, może wpływać na wiarygodność porównań między latami czy po prostu nawet podczas wyliczania średniej. Jednak nie zapominajmy, że nie wszystkie pytania były zadawane co roku i to jest główną przyczyną dlaczego w latach nieparzystych jest więcej rekordów.
+  
+---
+
+Przyjrzyjmy się jeszcze naszym wynikom (data_value)
+```{r}
+summary(dane_state$Data_Value)
+```
+* Średnia ma prawie tę samą wartość co mediana - rozkład jest prawie symetryczny (wartość maksymalna jest całkiem mocno oddalona od 3 kwartyla, więc to ona mogła pociągnąć średnią do góry)
+* Rozstęp międzykwartylowy IQR = 37.4 - 31.7 = 5.7 - co świadczy o niskiej zmienności w obrębie środkowych 50% obserwacj.
+* Interesuje mnie ta wartość maksymalna - 85.30. Zobaczmy na jakie pytanie ludzie tak licznie odpowiedzieli twierdząco
+
+```{r}
+dane_state %>%
+  filter(Data_Value > 70) %>%
+  select(Question, State, Data_Value, Strat_Group) %>%
+  arrange(desc(Data_Value)) %>%
+  head(10) %>%
+  knitr::kable(caption = "Obserwacje z odsetkiem > 70%" )
+```
+
+To pytanie dotyczy osetka dorosłych, którzy spełniają minimalne rekomendacje WHO dotyczące aktywności fizycznej
+(≥150 min umiarkowanej lub ≥75 min intensywnej aktywności tygodniowo). Nie jest to wynik dziwny, ponieważ nawet zwykłe codzienne spacery mogą się przyczynić do wyrobienia zalecanej normy.
+
+Oczywiście rozkład zmiennej Data_Value wynika przede wszystkim z różnorodności pytań i tak naprawdę ciężko mówić o jakiś wartościach odstających, skoro dana wartość może dotyczyć różnego pytania. Lepiej więc patrzeć na dane pytanie z osobna lub badać stopień zróżnicowania (np między ilością aktywności fizycznej)
+
+---
+
+## Skoro mamy już ogólne rozeznanie w danych, możemy przejść do konkretnych pytań badawczych...
+
+###  W którym rejonie odsetek osób z otyłością jest największy?
+Czy faktycznie zachód cechuje się najniższymi wskaźnikami otyłości, podczas gdy wschód posiada najgorsze wskaźniki w kraju?
+
+```{r}
+dane1 <- dane_state %>%
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  filter(Strat_Category == "Total") %>%
+  group_by(Region) %>%
+  summarise(
+    suma = sum(Data_Value, na.rm = TRUE),
+    liczba = sum(!is.na(Data_Value)),
+    srednia = suma / liczba
+  ) 
+
+
+knitr::kable(
+  dane1 %>%  select(Region, srednia), 
+  caption = "Średni odsetek otyłości wg regionu")
+```
+
+```{r}
+dane1 %>% 
+  ggplot(aes(x=reorder(Region, -srednia), y = srednia)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Średni odsetek otyłości wg regionu",
+    x = "Region",
+    y = "Średni oodsetek (%)"
+  )
+```
+
+Widzimy, że nie ma dużych różnic pomiędzy regionami.    
+Najmniejszym współczynnikiem cieszy się Northeast = ~28%, za to najwięszym South = 33.35%
+
+Dla potwierdzenia zastosujmy test statystyczny:
+Ho: Regiony nie różnią się poziomem otyłości
+H1: Przynajmniej jeden region ma inny poziom otyłości
+
+```{r}
+kw <- dane_state %>%
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  group_by(State, Region) %>%
+  summarise(
+    obesity = mean(Data_Value), 
+    .groups = "drop")
+
+kruskal.test(obesity ~ Region, data = kw)
+```
+Ponieważ p-value < 0.05 to odrzucamy hipotezę zerową. Potwierdziliśmy, że co najmniej jeden region ma inny średni poziom otyłości.
+
+Na nasze wyniki mogą mieć wpływ czynnik ekonomiczne i edukacyjne. Historycznie południe to region o najwyższym wskaźniku ubóstwa i najniższych dochodach. Przy czym odwrotnie na północy są najwyższe zarobki i lepszy poziom edukacji. 
+
+W takim razie zobaczmy jak konkretne czynniki wpływają na otyłość:
+
+### Czy niższy dochód zazwyczaj wiąże się z wyższym ryzykiem otyłości?
+
+z jednej strony można pomyśleć, że lepiej zarabiam = lepiej się odżywiam. Z kolei ludzie którzy pracują w firmach zazwyczaj przez większość czasu prowadzą siedzący tryb życia co z kolei może prowadzić do trudności z utrzymaniem wagi. Co na to dane?
+
+
+Na początku przygotujmy poziomy dochodu
+```{r}
+dochody<- c(
+  "Data not reported",
+  "Less than $15,000",
+  "$15,000 - $24,999",
+  "$25,000 - $34,999",
+  "$35,000 - $49,999",
+  "$50,000 - $74,999",
+  "$75,000 or greater"
+)
+```
+
+```{r}
+dane2 <- dane_state %>%
+  filter(Strat_Category == "Income",
+    Question == "Percent of adults aged 18 years and older who have obesity"
+  ) %>%
+  mutate(Strat_Group = factor(Strat_Group, levels = dochody )) %>% 
+  group_by(Region, Strat_Group) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    n = sum(!is.na(Data_Value)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+dane2 %>% 
+  ggplot(aes(x = srednia, y = Strat_Group)) +
+  geom_segment(aes(x = 0, xend = srednia, yend = Strat_Group),
+               linewidth = 0.6, alpha = 0.5) +
+  geom_point(size = 3) +
+  facet_wrap(~Region) +
+  labs(
+    title = "Poziom otyłości a dochód",
+    x = "Średni % otyłości",
+    y = "Przedział dochodowy"
+  ) +
+  theme_minimal()
+
+```
+
+Widzimy, że wraz ze wzrostem dochodu otsetek ludzi z otyłością maleje. Wpływ na to może mieć na przykład cena zdrowszych produktów, wolne środki na gotowy catering czy doświadczonych trenerów.
+
+
+### Jak wykształcenie wpływa na otyłość?
+Tutaj również można dwa różne punkty wyjścia - więcej czasu poświęciłem na naukę, pisanie prac niż na ruch lub skoro mam wyższe wykształcenie to posiadam ogólną wiedzę o wpływie różnych czynników na zdrowie i wiem jak o siebie dbać.
+
+```{r}
+wyksztalcenie <- c(
+  "Less than high school",
+  "High school graduate",
+  "Some college or technical school",
+  "College graduate"
+)
+```
+
+```{r}
+dane3 <- dane_state %>%
+  filter(Strat_Category == "Education") %>% 
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  mutate(Strat_Group = factor(Strat_Group, levels = wyksztalcenie)) %>% 
+  group_by(Region, Strat_Group) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    n = sum(!is.na(Data_Value)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+dane3 %>% 
+  ggplot(aes(x = srednia, y = Strat_Group)) + 
+  geom_segment(aes(x = 0, xend = srednia, yend = Strat_Group),
+               linewidth = 0.6, alpha = 0.5) +
+  geom_point(size = 3) +
+  facet_wrap(~Region) +
+  labs(
+    title = "Poziom otyłości a wykstałcenie",
+    x = "Średni % otyłości",
+    y = "Rodzaj wykształcenia"
+  ) +
+  theme_minimal()
+```
+
+Widzimy, że ludzi którzy nie ukończyli collegu cechują się wyższym poziomem otyłości. Dla pozostałych 3 kategori odsetek wacha się w granicach 30-37%. Wcześniej wykazaliśmy, że wyższy dochód jest czynnikiem wpływającym na otyłość, a zazwyczaj ludzie z wyższym wykształceniem zarabiają więcej.
+
+
+Wspomnieliśmy wcześniej o siedzącym trybie życia. Jest powszechnie wiadomo, że im więcej się ruszasz tym więcej kalorii spalasz. Czyli wzgędnie ludzie, którzy ruszają się więcej mają mniejsze szanse na zostanie otyłym. Choć oprócz samej ilości znacząca jest także intensywność:
+
+W ciągu 15 minut:
+
+* w wolnym biegu spalimy ok 130-150 kcal
+* Podczas skakania na skakance ok 190-220 kcal
+
+W takim razie przyjrzyjmy się tej kwesti bliżej:
+Na początku zobaczmy jak ogólnie Amerykanie podchodzą do aktywności fizycznaej, a następnie sprawdźmy jak sama aktywność wiąże się z otyłością.
+
+### Jaki rodzaj aktywność fizycznej dominuje? Czy większość społeczeństwa spełnia minimalne normy?
+
+Na początku zobaczmy jaki mamy podział aktywności fizycznej
+```{r}
+aktywnosc <- dane_state %>% 
+  filter(Class == "Physical Activity") %>% 
+  distinct(Question)
+
+print(aktywnosc)
+```
+
+Widać że tutaj również warto przypisać poziomy
+```{r}
+poz_aktywnosc <- c(
+  "Percent of adults who engage in no leisure-time physical activity",
+  "Percent of adults who engage in muscle-strengthening activities on 2 or more days a week",
+  "Percent of adults who achieve at least 150 minutes a week of moderate-intensity aerobic physical activity or 75 minutes a week of vigorous-intensity aerobic activity (or an equivalent combination)",
+  "Percent of adults who achieve at least 150 minutes a week of moderate-intensity aerobic physical activity or 75 minutes a week of vigorous-intensity aerobic physical activity (or an equivalent combination) and engage in muscle-strengthening activities on 2 or more days a week",
+  "Percent of adults who achieve more than 300 minutes a week of moderate-intensity aerobic physical activity or 150 minutes a week of vigorous-intensity aerobic activity (or an equivalent combination)"
+)
+```
+
+Z uwagi na czytelność wykresu, przypisze pytaniom (a właściwie im poziomom) odpowiednią nazwę
+```{r}
+legenda_aktywnosci <- data.frame(Question = poz_aktywnosc,Level = 1:5) %>%
+  mutate(Level = factor(Level))
+
+knitr::kable(legenda_aktywnosci, caption = "Poziomy aktywności")
+```
+Myślę, że warto wytłumaczyć skąd taka hierarchia:
+
+* Brak aktywności: najwyższe ryzyko przyrostu masy ciała i chorób sercowo-naczyniowych.
+
+* Tylko ćwiczenia siłowe: wzmacniasz mięśnie i kości, poprawiasz sylwetkę i metabolizm, ale mniej rozwijasz wydolność tlenową.
+
+* Minimum cardio (zalecenia WHO): spełniasz podstawowe normy zdrowotne: 150–300 min/tydz umiarkowanej aktywności (szybki marsz) lub 75–150 min/tydz intensywnej (bieg)
+
+* Cardio + siłowe: najbardziej “kompletna” opcja – łączy korzyści dla wydolności (serce, układ krążenia) i dla mięśni/kości.
+
+* Powyżej 300 min/tydz.: bardzo wysoka aktywność (budowanie kondycji, znaczne spalanie kalorii)   
+
+
+
+**Z uwagi na dostępność danych do analizy weźmiemy dane z lat: 2011, 2013, 2015, 2017, 2019, 2023**
+
+Najpierw zobaczmy jak to wygląda zbiorczo
+```{r}
+badane_lata <- c(2011, 2013, 2015, 2017, 2019, 2023)
+
+dane4 <- dane_state %>%
+  filter(Year %in% badane_lata) %>% 
+  filter(Class == "Physical Activity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  group_by(Question, Region) %>% 
+    summarise(
+    suma = sum(Data_Value, na.rm = TRUE),
+    liczba = sum(!is.na(Data_Value)),
+    srednia = suma / liczba,
+    .groups = "drop"
+  )
+```
+
+```{r}
+dane4 <- dane4 %>%
+  left_join(legenda_aktywnosci, by = "Question")
+```
+
+```{r}
+dane4 %>% 
+  ggplot() +
+  geom_col(aes(x = Region, y = srednia, fill = Level),
+           color = "white",
+           position = "dodge2") +
+  scale_fill_brewer(palette = "Blues")  +
+  #scale_fill_manual(values = c("lightblue", "skyblue", "royalblue", "blue", "navy")) + 
+  theme_bw() +
+  labs(title = "Poziom aktywności fizycznej w poszcególncyh regionach",
+       x = "Region",
+       y = "Średnia wartość (%)",
+       fill = "Poziom (1-5)")
+```
+
+Spostrzeżenia:
+W każdym rejonie balans poziomu aktywności jest podobny: 
+
+* Średnie dla poziomu 3 wypadają najlepiej - duży odsetek ludzi spełnia minimum zalecane przez WHO.  
+
+* Najmniejszy odsetek dotyczy najbardziej kompletnej opcji - Cardio + siłowe (jedynie wyjątek w rejonie West, gdzie najmniejszy odsetek dotyczy braku poświęcania wolnego czasu na aktywność fizyczną)
+
+* W każdym rejonie ponad 20% społeczeństwa nie poświęca wolnego czasu na aktywność fizyczną - jest to dość sporo.
+
+* Aż 30-40% wykazuje intensywną aktywność ficzyczną (level 5)
+
+---
+
+### Jak intensywność aktywności fizycznej wpływa na otyłość?
+
+Sprawdźmy teraz czy powszechna wiedza: Więcej ruchu = lepsza sylwetka, ma potwierdzenie w danych
+
+```{r}
+badane_lata <- c(2011, 2013, 2015, 2017, 2019, 2023)
+
+dane_otylosc <- dane_state %>%
+  filter(Year %in% badane_lata) %>% 
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  select(Year, State, otylosc_proc = Data_Value)
+
+```
+
+```{r}
+dane_sport <- dane_state %>%
+  filter(Year %in% badane_lata) %>% 
+  filter(Class == "Physical Activity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  select(Year, State, Question, aktywnosc_proc = Data_Value) %>% 
+  left_join(legenda_aktywnosci, by = "Question")
+```
+
+```{r}
+dane_sport_szerokie <- dane_sport %>%
+  select(Year, State, Level, aktywnosc_proc) %>% 
+  pivot_wider(
+    names_from = Level,
+    names_prefix = "L",
+    values_from = aktywnosc_proc
+  )
+```
+
+```{r}
+dane5 <- dane_sport_szerokie %>% 
+  left_join(dane_otylosc, by = c("Year", "State"))
+
+```
+
+Korelacja Spearmana
+```{r}
+korelacja_sp <- dane5 %>% 
+  select("L1", "L2", "L3", "L4", "L5") %>% 
+  sapply(cor, y = dane5$otylosc_proc, method = "spearman", use = "complete.obs") %>% 
+  sort() 
+
+knitr::kable(korelacja_sp, col.names = "Korelacja", caption = "Związek aktywności z otyłością")
+```
+
+Zaobserwowaliśmy dodatnią zależność dla osób nie poświęcająych czasu na aktywność fizyczną oraz coraz bardziej ujemną zależność wraz ze zwiększeniem stopnia aktywności fizycznej. Czyli wyższy poziom aktywności jest powiązany z niższym odsetkiem otyłości.
+
+---
+
+Wcześniej badaliśmy jak wykształcenie wpływa na poziom otyłości. (dla przypomnienia w skrócie: im wyższy poziom wykształcenia, tym mniejsza otyłość). Skoro przed chwilą zobaczyliśmy wpływ ruchu na poziom naszej tkanki tłuszczowej to zobaczmy czy niższy poziom otyłości wynika z większej ilości ruchu.
+
+### Poziom wykształcenia a ilość aktywności fizycznej
+
+```{r}
+dane7 <- dane_state %>% 
+  filter(Year %in% badane_lata) %>% 
+  filter(Class == "Physical Activity") %>% 
+  filter(Strat_Category == "Education") %>% 
+  select(Year, State, Question, Data_Value, Strat_Group) %>% 
+  left_join(legenda_aktywnosci, by = "Question")
+```
+
+```{r}
+dane7.1 <- dane7 %>%
+  mutate(Strat_Group = factor(Strat_Group, levels = wyksztalcenie)) %>%
+  group_by(Strat_Group, Level) %>% 
+    summarise(
+    suma = sum(Data_Value, na.rm = TRUE),
+    liczba = sum(!is.na(Data_Value)),
+    srednia = suma / liczba,
+    .groups = "drop"
+    )
+```
+
+```{r, fig.width=10, fig.height=7, out.width="100%"}
+dane7.1 %>% 
+  ggplot() +
+  geom_col(aes(x= Strat_Group, y = srednia, fill = Level),
+           color = "white",
+           position = "dodge2") +
+  scale_fill_brewer(palette = "Blues")  +
+  theme_bw() +
+  labs(
+    title = "Poziom wykształcenia, a ilość aktywności fizycznej",
+    x = "Wykształcenie",
+    y = "Odsetek badanych [%]",
+    fill = "Poziom aktywności"
+  )
+```
+
+Wraz ze wzrostem poziomu wykształcenia obserwujemy wyraźny wzrost ogólnej aktywności fizycznej. Odsetek osób całkowicie unikających sportu w grupie z wykształceniem wyższym jest ponad dwukrotnie niższy niż wśród osób bez wykształcenia. Jednocześnie wraz ze wzrostem poziomu wykształcenia wzrasta odsetek osób deklarujący intensywny poziom aktywności (Poziom 4 oraz 5)
+
+
+---
+ 
+W naszym zbiorze danych mamy również dane dotyczące diety: 
+
+* procent jedzący mniej niej 1 owoc dziennie
+* procent jedzący mniej niż 1 warzywo dennie
+
+Szybkie rozeznanie:
+```{r}
+owoce <- dane_state %>% 
+  filter(Class == "Fruits and Vegetables") %>% 
+  filter(Question == "Percent of adults who report consuming fruit less than one time daily") %>% 
+  filter(Strat_Category == "Total") %>%
+  select(Data_Value)
+  
+summary(owoce)
+```
+
+```{r}
+warzywa <- dane_state %>% 
+  filter(Class == "Fruits and Vegetables") %>% 
+  filter(Question == "Percent of adults who report consuming vegetables less than one time daily") %>% 
+  filter(Strat_Category == "Total") %>%
+  select(Data_Value)
+  
+summary(warzywa)
+```
+```{r}
+pytania_dieta <- c("Percent of adults who report consuming fruit less than one time daily","Percent of adults who report consuming vegetables less than one time daily")
+
+koszyk_warzywniak <- dane_state %>%
+  filter(Strat_Category == "Total") %>% 
+  filter(Question %in% pytania_dieta)
+```
+
+```{r, warning = FALSE, message= FALSE}
+koszyk_warzywniak %>% 
+  ggplot()+
+  geom_boxplot(aes(x=Question, y= Data_Value))+
+  scale_x_discrete(labels = c(
+    "Percent of adults who report consuming fruit less than one time daily" = "Owoce",
+    "Percent of adults who report consuming vegetables less than one time daily" = "Warzywa"
+  )) +
+  labs(
+    title = "Porównanie niskiego spożycia owoców i warzyw",
+    x = "",
+    y = "Odsetek (%)"
+  ) +
+  theme_bw()
+```
+
+Widać, że odsetek osób spożywających owoce rzadziej niż raz dziennie (średnia ok. 39%) jest niemal dwukrotnie wyższy niż w przypadku warzyw (średnia ok 19%). Ku mojemu zdziwieniu ludzie jedzą więcej warzyw niż owoców.
+
+Przejdźmy do naszego pytania
+
+### Co lepiej tłumaczy różnice w otyłości: brak aktywności fizycznej czy brak owoców w diecie?
+
+Na początku zobaczmy jaki wpływ na otyłość mają same owoce:
+
+(Pytania o owoce i warzywa były zadawane w latach: 2017, 2019, 2021)
+```{r}
+badane_lata_owoce <- c(2017, 2019, 2021)
+
+dane_otylosc_6 <- dane_state %>%
+  filter(Year %in% badane_lata_owoce) %>% 
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  select(Year, State, otylosc_proc = Data_Value)
+```
+
+```{r}
+dane_owoce <- dane_state %>%
+  filter(Year %in% badane_lata_owoce) %>% 
+  filter(Class == "Fruits and Vegetables") %>% 
+  filter(Question == "Percent of adults who report consuming fruit less than one time daily") %>% 
+  filter(Strat_Category == "Total") %>% 
+  select(Year, State, Question, owoc_procent = Data_Value)
+```
+
+```{r}
+dane6 <- dane_otylosc_6 %>% 
+  left_join(dane_owoce, by = c("Year", "State"))
+```
+
+```{r}
+korelacja_ruch <- dane_state %>% 
+  filter(Year %in% badane_lata_owoce) %>% 
+  filter(Question == "Percent of adults who engage in no leisure-time physical activity") %>% 
+  filter(Strat_Category == "Total") %>% 
+  select(Year, State, Question, bezruch_procent = Data_Value)
+```
+
+```{r}
+dane6.1 <- dane_otylosc_6 %>% 
+  left_join(korelacja_ruch, by = c("Year", "State"))
+```
+
+```{r, warning = FALSE, message= FALSE}
+ggplot(dane6, aes(x = owoc_procent, y = otylosc_proc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ Year) +
+  labs(
+    title = "Brak owoców a otyłość",
+    x = "Odsetek (%) jedzących owoce rzadziej niż 1× dziennie",
+    y = "Otyłość (%)"
+  ) +
+  theme_bw()
+```
+
+```{r,echo=FALSE,  warning = FALSE, message= FALSE}
+ggplot(dane6.1, aes(x = bezruch_procent, y = otylosc_proc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ Year) +
+  labs(
+    title = "Wpływ braku ruchu na otyłość",
+    x = "Odsetek nie uprawiający aktywnoścu fizycznej",
+    y = "Otyłość (%)"
+  ) +
+  theme_bw()
+```
+```{r}
+cor(dane6$owoc_procent, dane6$otylosc_proc, use = "complete.obs", method = "spearman")
+```
+
+```{r}
+cor(dane6.1$bezruch_procent, dane6$otylosc_proc, use = "complete.obs", method = "spearman")
+```
+Potwierdźmy nasze wyniki testem:
+Ho: p = 0 (brak zależności)
+H1: p ≠ 0 (istnieje zależność)
+
+```{r, warning=FALSE}
+cor.test(dane6.1$otylosc_proc, dane6.1$bezruch_procent,
+         method = "spearman", use = "complete.obs")
+```
+Odrzucamy hipotezę zerową Ho. w danych występuje istotna statystycznie dodatnia korelacja.
+
+
+Zarówno wskaźnik braku aktywności, jak i rzadszego spożycia owoców są dodatnio skorelowane z otyłością. Jednak korelacja otyłości z rzadszym spożyciem owoców jest silniejsza niż z brakiem aktywności w czasie wolnym. Z praktycznego punktu widzenia łatwiej jest przyjąć przykładowo 300kcal niż je spalić.
+
+---
+ 
+Skoro już jesteśmy przy temacie odżywiania i wczesnej sprawdzaliśmy jaki wpływ ma wykształcenie na różne czynniki to naturalnym następnym krokiem będzie sprawdzenie jak poziom wykształcenia wpływa na nasze decyzje dietowe. 
+
+### Wpływ dochodu na nawyki żywieniowe.
+
+
+```{r}
+dane9 <- dane_state %>% 
+  filter(Question == "Percent of adults who report consuming fruit less than one time daily" | Question == "Percent of adults who report consuming vegetables less than one time daily") %>% 
+  filter(Strat_Category == "Income") %>% 
+  mutate(Strat_Group = factor(Strat_Group, levels = dochody )) %>% 
+  group_by(Question, Strat_Group) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+dane9 %>% 
+  ggplot(aes(x = Strat_Group, y = srednia))+
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~Question, ncol = 1) +
+  labs(
+    title = "Poziom dochodu a nawyki żywieniowe",
+    x= "Poziom dochodu",
+    y= "Odsetek osób jedzących < 1 raz dziennie"
+  ) + 
+  theme_bw()
+```
+
+Dzięki wizualizacji widzimy, że dochód sprzyja pozytywnym decyzjom żywieniowym. 
+Jednak większa różnica jest w konsumpcji warzyw - około 16.65%, podczas gdy różnica w konsumpcji owoców wynosi około 8,6
+
+
+### Czy w regionach otyłość rośnie, maleje czy jest stabilna?
+
+```{r}
+dane8 <- dane_state %>% 
+  filter(Question == "Percent of adults aged 18 years and older who have obesity") %>% 
+  filter(Strat_Category == "Total") %>%
+  group_by(Year, Region) %>% 
+  summarise(
+    srednia = mean(Data_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+dane8 %>% 
+  ggplot()+
+  geom_line(aes(x = as.factor(Year), y = srednia, color = Region, group = Region),
+            linewidth = 1.2) +
+  scale_color_brewer(palette = "Set1")+
+  labs(
+    title = "Poziom otyłości z biegiem lat",
+    x= "Lata",
+    y= "Średni poziom otyłości [%]",
+    color= "Region"
+  )+
+  theme_bw()
+```
+
+W latach 2011–2024 obserwujemy wyraźny wzrost odsetka dorosłych osób z otyłością we wszystkich regionach USA. Najwyższe poziomy otyłości przez cały okres charakteryzują regiony South oraz North Central, które wyraźnie odstają od pozostałych części kraju.
+Warto jednak zauważyć, że region South jako jedyny wykazuje w ostatnich dwóch latach niewielką tendencję spadkową, podczas gdy w pozostałych regionach poziom otyłości utrzymuje tendencje wzrostową.
+
+
