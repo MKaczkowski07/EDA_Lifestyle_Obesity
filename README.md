@@ -1,6 +1,6 @@
 # Raport Analityczny: Determinanty Otyłości i Zdrowia Publicznego w USA (2011-2024)
 
-🌍 **Wersja interaktywna:** [Zobacz wyrenderowany raport HTML]([https://mkaczkowski07.github.io/EDA_Health/](https://mkaczkowski07.github.io/EDA_Lifestyle_Obesity/EDA_RMD.html))
+🌍 **Wersja interaktywna:** [Zobacz wyrenderowany raport HTML](https://mkaczkowski07.github.io/EDA_Lifestyle_Obesity/EDA_RMD.html)
 
 Kompleksowa Analiza Eksploracyjna (EDA) badająca powiązania między czynnikami społeczno-ekonomicznymi, nawykami behawioralnymi a wskaźnikami zdrowotnymi w Stanach Zjednoczonych. 
 
